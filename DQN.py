@@ -10,7 +10,7 @@ import random
 from collections import deque
 
 USE_CUDA = torch.cuda.is_available()
-Variable = lambda *args, **kwargs: autograd.Variable(*args, **kwargs).cuda() if USE_CUDA else autograd.Variable(*args, **kwargs)
+CUDA = lambda args: args.cuda() if USE_CUDA else args
 
 class Net(nn.Module):
     def __init__(self, input_shape, num_actions, gamma):
@@ -30,61 +30,81 @@ class Net(nn.Module):
         )
         
         self.fc = nn.Sequential(
-            nn.Linear(self.feature_size(), 512),
+            nn.Linear(self.feature_size()+2, 512),
             nn.ReLU(),
             nn.Linear(512, self.num_actions)
         )
         
-    def forward(self, x):
-        x = self.features(x)
+    def forward(self, img, state):
+        x = self.features(img)
         x = x.view(x.size(0), -1)
+        x = torch.cat((x, state), dim=1)
         x = self.fc(x)
         return x
     
     def feature_size(self):
-        return self.features(autograd.Variable(torch.zeros(1, *self.input_shape))).view(1, -1).size(1)
+        return self.features(torch.zeros(1, *self.input_shape)).view(1, -1).size(1)
     
-    def act(self, state, epsilon):
+    def act(self, obs, state, epsilon):
         if random.random() > epsilon:
-            state   = Variable(torch.FloatTensor(np.float32(state)).unsqueeze(0), volatile=True)
-            q_value = self.forward(state)
-            action  = q_value.max(1)[1].data[0]
+            with torch.no_grad():
+                obs     = CUDA(torch.FloatTensor(np.float32(obs)).unsqueeze(0))
+                state   = CUDA(torch.FloatTensor(np.float32(state)).unsqueeze(0))
+                q_value = self.forward(obs, state)
+                action  = q_value.max(1)[1].data[0]
         else:
             action = random.randrange(self.num_actions)
         return action
 
     def compute_td_loss(self, batch_size, replay_buffer):
-        state, action, reward, next_state, done = replay_buffer.sample(batch_size)
-        state      = Variable(torch.FloatTensor(np.float32(state)))
-        next_state = Variable(torch.FloatTensor(np.float32(next_state)), volatile=True)
-        action     = Variable(torch.LongTensor(action))
-        reward     = Variable(torch.FloatTensor(reward))
-        done       = Variable(torch.FloatTensor(done))
+        obs, state, action, reward, next_obs, next_state, done = replay_buffer.sample(batch_size)
+        obs        = CUDA(torch.FloatTensor(obs))
+        state      = CUDA(torch.FloatTensor(state))
+        next_obs   = CUDA(torch.FloatTensor(next_obs))
+        next_state = CUDA(torch.FloatTensor(next_state))
+        action     = CUDA(torch.LongTensor(action))
+        reward     = CUDA(torch.FloatTensor(reward))
+        done       = CUDA(torch.FloatTensor(done))
 
-        q_values      = self.forward(state)
-        next_q_values = self.forward(next_state)
+        q_values      = self.forward(obs, state)
+        next_q_values = self.forward(next_obs, next_state)
 
         q_value          = q_values.gather(1, action.unsqueeze(1)).squeeze(1)
         next_q_value     = next_q_values.max(1)[0]
         expected_q_value = reward + self.gamma * next_q_value * (1 - done)
         
-        loss = (q_value - Variable(expected_q_value.data)).pow(2).mean()
+        loss = (q_value - CUDA(expected_q_value.data)).pow(2).mean()
         
         return loss
+
+    def save(self, path, epoch=None, optim_state=None, loss=None):
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': self.state_dict(),
+            'optimizer_state_dict': optim_state,
+            'loss': loss,
+        }, path)
 
 class ReplayBuffer(object):
     def __init__(self, capacity):
         self.buffer = deque(maxlen=capacity)
     
-    def push(self, state, action, reward, next_state, done):
+    def push(self, obs, state, action, reward, next_obs, next_state, done):
+        obs        = np.expand_dims(obs, 0)
         state      = np.expand_dims(state, 0)
+        next_obs   = np.expand_dims(next_obs, 0)
         next_state = np.expand_dims(next_state, 0)
             
-        self.buffer.append((state, action, reward, next_state, done))
+        self.buffer.append((obs, state, action, reward, next_obs, next_state, done))
     
     def sample(self, batch_size):
-        state, action, reward, next_state, done = zip(*random.sample(self.buffer, batch_size))
-        return np.concatenate(state), action, reward, np.concatenate(next_state), done
+        obs, state, action, reward, next_obs, next_state, done = zip(*random.sample(self.buffer, batch_size))
+        obs        = np.concatenate(obs, dtype=np.float32) / 255
+        state      = np.concatenate(state, dtype=np.float32)
+        next_obs   = np.concatenate(next_obs, dtype=np.float32) / 255
+        next_state = np.concatenate(next_state, dtype=np.float32)
+
+        return obs, state, action, reward, next_obs, next_state, done
     
     def __len__(self):
         return len(self.buffer)

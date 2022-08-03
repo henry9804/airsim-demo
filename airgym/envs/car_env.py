@@ -11,23 +11,26 @@ from airgym.envs.airsim_env import AirSimEnv
 import matplotlib.pyplot as plt
 
 class AirSimCarEnv(AirSimEnv):
-    def __init__(self, ip_address, image_shape):
+    def __init__(self, ip_address, image_shape, target):
         super().__init__(image_shape)
 
         self.image_shape = image_shape
-        self.start_ts = 0
+        self.elapsed_t = 0
+        self.target_pos = target
 
         self.state = {
             "position": np.zeros(3),
             "prev_position": np.zeros(3),
-            "pose": None,
-            "prev_pose": None,
+            "pose": np.zeros(3),
+            "prev_pose": np.zeros(3),
+            "target_diff": np.zeros(2),
             "collision": False,
             "result": None
         }
 
         self.car = airsim.CarClient(ip=ip_address)
-        self.action_space = spaces.Discrete(6)
+        self.action_space = spaces.Discrete(9)
+        # self.action_space = spaces.Box(np.array([0, 0, -0.5]), np.array([1, 1, 0.5]))   #throttle, brake, steering
 
         self.image_request = airsim.ImageRequest(
             "0", airsim.ImageType.DepthPerspective, True, False
@@ -40,34 +43,47 @@ class AirSimCarEnv(AirSimEnv):
         self.car.reset()
         self.car.enableApiControl(True)
         self.car.armDisarm(True)
+        self.elapsed_t = 0
         time.sleep(0.01)
 
     def __del__(self):
         self.car.reset()
 
     def _do_action(self, action):
+        self.car_controls.throttle = 0
         self.car_controls.brake = 0
-        self.car_controls.throttle = 1
+        self.car_controls.steering = 0
 
-        if action == 0:                         # brake
-            self.car_controls.throttle = 0
-            self.car_controls.brake = 1
-        elif action == 1:                       # go straight
-            self.car_controls.steering = 0
-        elif action == 2:                       # turn right rapidly
+        if action == 1:                         # brake
+            self.car_controls.brake = 1        
+        elif action == 2:                       # accelerate
+            self.car_controls.throttle = 1
+
+        elif action == 3:                       # turn right w accel
+            self.car_controls.throttle = 1
             self.car_controls.steering = 0.5
-        elif action == 3:                       # turn left rapidly
+        elif action == 4:                       # turn left w accel
+            self.car_controls.throttle = 1
             self.car_controls.steering = -0.5
-        elif action == 4:                       # turn right slowly
-            self.car_controls.steering = 0.25
-        else:                                   # turn left slowly
-            self.car_controls.steering = -0.25
 
+        elif action == 5:                       # turn right w/o accel
+            self.car_controls.steering = 0.5
+        elif action == 6:                       # turn left w/o accel
+            self.car_controls.steering = -0.5
+        
+        elif action == 7:                       # turn right w brake
+            self.car_controls.brake = 1
+            self.car_controls.steering = 0.5
+        elif action == 8:                       # turn left w brake
+            self.car_controls.brake = 1
+            self.car_controls.steering = -0.5
+        
         self.car.setCarControls(self.car_controls)
-        time.sleep(1)
+        self.elapsed_t += 1
+        time.sleep(0.05)
 
     def transform_obs(self, response):
-        img1d = np.array(response.image_data_float, dtype=np.float)
+        img1d = np.array(response.image_data_float, dtype=np.float32)
         img1d = 255 / np.maximum(np.ones(img1d.size), img1d)
         img2d = np.reshape(img1d, (response.height, response.width))
 
@@ -79,37 +95,72 @@ class AirSimCarEnv(AirSimEnv):
         return im_final.reshape([1, 84, 84])
 
     def _get_obs(self):
-        responses = self.car.simGetImages([self.image_request])
-        image = self.transform_obs(responses[0])
-
+        # STATES
         self.car_state = self.car.getCarState()
         gps_data = self.car.getGpsData("Gps", "Car").gnss.geo_point
 
+        # position of car
         self.state["prev_position"] = self.state["position"]
-        self.state["position"] = np.array([gps_data.altitude, gps_data.latitude, gps_data.longitude])
+        # using Odometry
+        self.state["position"] = self.car_state.kinematics_estimated.position.to_numpy_array()
+        # using GPS
+        # self.state["position"] = np.array([gps_data.altitude, gps_data.latitude, gps_data.longitude])
+
+        # pose of car
         self.state["prev_pose"] = self.state["pose"]
-        self.state["pose"] = self.car_state.kinematics_estimated
+        # quartenion to euler
+        quat = self.car_state.kinematics_estimated.orientation.to_numpy_array()
+        t0 = 2.0 * (quat[3] * quat[0] + quat[1] * quat[2])
+        t1 = 1.0 - 2.0 * (quat[0]**2 + quat[1]**2)
+        roll_x = math.atan2(t0, t1)
+        t2 = 2.0 * (quat[3] * quat[1] - quat[2] * quat[0])
+        t2 = np.clip(t2, -1.0, 1.0)
+        pitch_y = math.asin(t2)
+        t3 = 2.0 * (quat[3] * quat[2] + quat[0] * quat[1])
+        t4 = 1.0 - 2.0 * (quat[1]**2 + quat[2]**2)
+        yaw_z = math.atan2(t3, t4)
+        self.state["pose"] = np.array([roll_x, pitch_y, yaw_z])
+
+        # target direction
+        target_vec = self.target_pos - self.state["position"]
+        target_dist = np.linalg.norm(target_vec)
+        target_dir = math.atan2(target_vec[1], target_vec[0])
+        angle = (target_dir - self.state["pose"][2])
+        if angle > np.pi:
+            angle -= (2*np.pi)
+        elif angle < -np.pi:
+            angle += (2*np.pi)
+        self.state["target_diff"] = np.array([target_dist, angle])
+
+        # collision info
         self.state["collision"] = self.car.simGetCollisionInfo().has_collided
+
+        # OBSERVATIONS
+        # camera image
+        responses = self.car.simGetImages([self.image_request])
+        image = self.transform_obs(responses[0])
 
         return image
 
     def _compute_reward(self):
-        target_pt = np.array([-82.4, -102.7, 0])
-        car_pt = self.state["pose"].position.to_numpy_array()
+        reward = -0.1
+        done = False
+        if self.state["target_diff"][0] < 1:
+            reward += 10
+            done = True
+            self.state["result"] = "arrive"
+        elif self.elapsed_t > 500:
+            done = True
+            self.state["result"] = "time out"
+        elif self.state["collision"]:
+            reward -= 10
+            done = True
+            self.state["result"] = "crash"
 
-        dist = np.linalg.norm(target_pt - car_pt)
+        angle = np.abs(self.state["target_diff"][1])/np.pi                  # 0.0 ~ 1.0
+        dist = self.state["target_diff"][0]/np.linalg.norm(self.target_pos) # 0.0 ~ inf, initially 1.0
 
-        reward = 1
-        done = 0
-        if dist < 1:
-            done = 1
-            self.state["info"] = "arrive"
-        if self.state["collision"]:
-            reward = 0
-            done = 1
-            self.state["info"] = "crash"
-
-        reward += 1/dist
+        reward -= (angle + dist)
 
         return reward, done
 
@@ -119,7 +170,7 @@ class AirSimCarEnv(AirSimEnv):
         reward, done = self._compute_reward()
         return obs, reward, done, self.state
 
-    def reset(self):
+    def reset(self, seed=None, return_info=False, options=None):
         self._setup_car()
-        self._do_action(1)
+        self._do_action(0)
         return self._get_obs()
